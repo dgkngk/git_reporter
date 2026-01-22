@@ -3,18 +3,21 @@ import csv
 import datetime
 import json
 import os
-import shutil
 import subprocess
 import sys
 import textwrap
 
+import google.genai as genai
 from dateutil.relativedelta import relativedelta
+from dotenv import load_dotenv
+
+# Load environment variables from .env file immediately
+load_dotenv()
 
 # --- CONFIGURATION ---
-CLI_TOOL_NAME = "gemini"
 TEMP_DIFF_FILE = "temp_commit_context.txt"
 
-# Files to exclude to keep diffs readable and within limits
+# Files to exclude to keep diffs readable
 IGNORED_FILES = [
     "package-lock.json",
     "yarn.lock",
@@ -29,7 +32,7 @@ IGNORED_FILES = [
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Generate report using git diffs and Gemini CLI."
+        description="Generate report using git diffs and Gemini API."
     )
     parser.add_argument("--name", required=True, help="Display name for the report.")
     parser.add_argument(
@@ -37,7 +40,7 @@ def parse_arguments():
     )
     parser.add_argument("--repos", nargs="+", default=["."], help="List of repo paths.")
     parser.add_argument(
-        "--output", default="Developer_Report_Template.csv", help="Output CSV path."
+        "--output", default="Engineering_Value_Report.csv", help="Output CSV path."
     )
 
     date_group = parser.add_mutually_exclusive_group(required=True)
@@ -107,83 +110,46 @@ def get_git_commits_with_diffs(aliases, start, end, repo_path):
 
 def run_gemini_pipeline(context_file_path):
     """
-    Pipes the temp file to the CLI with the specific user prompt.
+    Reads the temp file and sends it to Gemini API directly.
     """
-    cli_path = shutil.which(CLI_TOOL_NAME)
-    if not cli_path:
-        print(f"Error: '{CLI_TOOL_NAME}' not found in PATH.")
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        print(
+            "Error: GOOGLE_API_KEY not found. Please set it in a .env file or environment variable."
+        )
         sys.exit(1)
+    client = genai.Client(api_key=api_key)
+    chat = client.chats.create(model="gemini-2.5-flash")
 
-    # --- UPDATED PROMPT ---
-    # 1. Removed "current_work"
-    # 2. Changed "completed_tasks" (list) to "completed_summary" (string)
-    # 3. Updated instructions to focus on summarization.
-    prompt_text = textwrap.dedent("""
-    You are a Data Analysis and JSON Extraction AI. Your ONLY job is to analyze the provided Git Commits and Diffs, then create a strict JSON object output.
+    with open(context_file_path, "r", encoding="utf-8") as f:
+        diff_data = f.read()
 
-    --- CONTENT EXPECTED
-    key:value
-    projects: List of project or repo names worked on
-    completed_summary: A concise technical summary paragraph describing the work completed, bugs fixed, and features implemented.
-    next_steps: A sentence inferring logical next steps based on the code changes
-    ---
+    prompt = textwrap.dedent(f"""
+    You are a Data Analysis AI. Your job is to analyze Git Commits and output strict JSON.
 
-    --- RULES
-    Output valid JSON only. Do NOT write an introduction, conclusion, or markdown analysis. Do NOT use markdown formatting.
-    ---
+    INPUT DATA:
+    {diff_data[:100000]}
 
-    INPUT DATA TO PROCESS:
+    OUTPUT FORMAT (JSON ONLY):
+    {{
+        "projects": ["list", "of", "repos"],
+        "completed_summary": "Concise technical summary of work completed...",
+        "next_steps": "Inferred next steps..."
+    }}
     """)
 
-    # Flags first, then prompt
-    cmd = [cli_path, "--output-format", "json", prompt_text]
-
-    print(f"Piping context from {context_file_path} to Gemini...")
-
     try:
-        with open(context_file_path, "r", encoding="utf-8") as f:
-            result = subprocess.run(
-                cmd,
-                stdin=f,
-                capture_output=True,
-                text=True,
-                check=True,
-                encoding="utf-8",
-            )
-
-        raw_output = result.stdout.strip()
-
-        try:
-            parsed = json.loads(raw_output)
-
-            if "response" in parsed:
-                inner = parsed["response"]
-                if isinstance(inner, str):
-                    print(inner)
-                    return json.loads(inner)
-                return inner
-            return parsed
-
-        except json.JSONDecodeError:
-            print("Warning: AI output was not valid JSON.")
-            print(f"Raw Output start: {raw_output[:500]}...")
-            return None
-
-    except subprocess.CalledProcessError as e:
-        print(f"Gemini CLI Error: {e.stderr}")
+        response = chat.send_message(prompt)
+        text = response.text.replace("```json", "").replace("```", "")
+        print(text)
+        return json.loads(text)
+    except Exception as e:
+        print(f"AI Error: {e}")
         return None
 
 
 def update_csv(filename, data, month_label, author_name):
-    # Headers match your provided template
-    headers = [
-        "Month",
-        "Name",
-        "Project(s)",
-        "Current Work",
-        "Completed Tasks / Fixes",
-        "Next Steps / Plans for Next Month",
-    ]
+    headers = ["Month", "Name", "Project(s)", "Completed Tasks", "Next Steps"]
 
     file_exists = os.path.isfile(filename)
     try:
@@ -192,22 +158,17 @@ def update_csv(filename, data, month_label, author_name):
             if not file_exists:
                 writer.writeheader()
 
-            # Join projects list if it exists
             projects = data.get("projects", [])
-            if isinstance(projects, list):
-                project_str = ", ".join(projects)
-            else:
-                project_str = str(projects)
+            project_str = (
+                ", ".join(projects) if isinstance(projects, list) else str(projects)
+            )
 
-            # Write the row
-            # Note: 'Current Work' is left empty ("") as requested.
             row = {
                 "Month": month_label,
                 "Name": author_name,
                 "Project(s)": project_str,
-                "Current Work": "",
-                "Completed Tasks / Fixes": data.get("completed_summary", ""),
-                "Next Steps / Plans for Next Month": data.get("next_steps", ""),
+                "Completed Tasks": data.get("completed_summary", ""),
+                "Next Steps": data.get("next_steps", ""),
             }
             writer.writerow(row)
             print(f"Success! Report appended to: {filename}")
@@ -218,7 +179,6 @@ def update_csv(filename, data, month_label, author_name):
 if __name__ == "__main__":
     args = parse_arguments()
     start_d, end_d, month_lbl = calculate_dates(args)
-    print(f"Range: {start_d} to {end_d}")
 
     all_content = []
     for repo in args.repos:
@@ -233,8 +193,9 @@ if __name__ == "__main__":
             f.write(full_payload)
 
         ai_data = run_gemini_pipeline(TEMP_DIFF_FILE)
-
         if ai_data:
             update_csv(args.output, ai_data, month_lbl, args.name)
+            if os.path.exists(TEMP_DIFF_FILE):
+                os.remove(TEMP_DIFF_FILE)
     else:
         print("No commits found.")
